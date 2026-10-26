@@ -1,0 +1,130 @@
+name: Publish PocketBase
+
+on:
+  schedule:
+    # 03:17 and 15:17 UTC (11:17 and 23:17 Singapore time).
+    - cron: "17 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "PocketBase version (blank follows latest stable; older versions get exact tags only)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even when all image tags already exist"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pocketbase-publish
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
+      publish: ${{ steps.release.outputs.publish }}
+      tags: ${{ steps.release.outputs.tags }}
+      ghcr: ${{ steps.release.outputs.ghcr }}
+      dockerhub: ${{ steps.release.outputs.dockerhub }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Resolve PocketBase release and registries
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          FORCE_BUILD: ${{ inputs.force }}
+          PUBLISH_GHCR: ${{ vars.PUBLISH_GHCR }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: python3 scripts/release.py resolve
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR for image checks
+        if: steps.release.outputs.ghcr == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Log in to Docker Hub for image checks
+        if: steps.release.outputs.dockerhub == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Check whether publication is needed
+        id: check
+        env:
+          IMAGE_TAGS: ${{ steps.release.outputs.tags }}
+          FORCE_BUILD: ${{ steps.release.outputs.force }}
+        run: python3 scripts/release.py check
+      - name: Summarize release check
+        env:
+          PB_VERSION: ${{ steps.release.outputs.version }}
+          BUILD: ${{ steps.check.outputs.build }}
+          PUBLISH: ${{ steps.release.outputs.publish }}
+        run: |
+          {
+            echo "PocketBase version: ${PB_VERSION}"
+            echo "Build needed: ${BUILD}"
+            echo "Publishing enabled: ${PUBLISH}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        if: needs.prepare.outputs.ghcr == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.dockerhub == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build both architectures and publish to enabled registries
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: ${{ needs.prepare.outputs.publish == 'true' }}
+          outputs: ${{ needs.prepare.outputs.publish != 'true' && 'type=oci,dest=/tmp/pocketbase-image.tar' || '' }}
+          tags: ${{ needs.prepare.outputs.tags }}
+          build-args: |
+            PB_VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=pocketbase
+          cache-to: type=gha,mode=max,scope=pocketbase
+          sbom: true
+          provenance: mode=max

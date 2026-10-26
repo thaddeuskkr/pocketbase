@@ -1,0 +1,36 @@
+name: Validate Docker changes
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .env.example
+      - compose.yml
+      - .github/workflows/**
+      - scripts/**
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .env.example
+      - compose.yml
+      - .github/workflows/**
+      - scripts/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pocketbase-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check Compose configuration
+        run: docker compose config --quiet
