@@ -48,7 +48,11 @@ def release_tags(version, is_latest):
 
 def registry_config(env):
     event = env.get("GITHUB_EVENT_NAME", "")
-    allowed = event in {"schedule", "workflow_dispatch"}
+    default_branch = env.get("DEFAULT_BRANCH", "")
+    allowed = event in {"schedule", "workflow_dispatch"} or (
+        event == "push" and bool(default_branch)
+        and env.get("GITHUB_REF") == f"refs/heads/{default_branch}"
+    )
     ghcr = allowed and env.get("PUBLISH_GHCR", "").lower() != "false" and bool(env.get("GH_TOKEN"))
     hub = allowed and bool(env.get("DOCKERHUB_USERNAME") and env.get("DOCKERHUB_TOKEN"))
     ghcr_image = "ghcr.io/" + env.get("GITHUB_REPOSITORY", "").lower()
@@ -96,6 +100,7 @@ def resolve(env, fetch=github_release):
         "dockerhub_image": hub_image,
         "publish": str(bool(images)).lower(),
         "force": str(force).lower(),
+        "images": "\n".join(images),
         "tags": "\n".join(tags),
     }
 
@@ -137,6 +142,33 @@ def needs_build(tags, force=False, run=subprocess.run):
     return False
 
 
+def publish_manifests(tags, digest_dir, run=subprocess.run):
+    if not tags:
+        raise ValueError("No image tags were provided for manifest publication")
+    digests = []
+    for _, arch in sorted(PLATFORMS):
+        digest = (Path(digest_dir) / f"{arch}.txt").read_text().strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError(f"Invalid image digest for {arch}")
+        digests.append(digest)
+
+    repositories = {}
+    for reference in tags:
+        image, separator, tag = reference.rpartition(":")
+        if not separator or not IMAGE.fullmatch(image) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+            raise ValueError(f"Invalid image tag: {reference!r}")
+        repositories.setdefault(image, []).append(reference)
+
+    # Both native builds must finish before any version aliases are published.
+    for image, references in repositories.items():
+        command = ["docker", "buildx", "imagetools", "create"]
+        for reference in references:
+            command.extend(["--tag", reference])
+        command.extend(f"{image}@{digest}" for digest in digests)
+        print(f"Publishing combined AMD64/ARM64 manifest for {image}", flush=True)
+        run(command, check=True)
+
+
 def write_outputs(values):
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
@@ -150,18 +182,22 @@ def write_outputs(values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["resolve", "check"])
+    parser.add_argument("command", choices=["resolve", "check", "merge"])
     args = parser.parse_args()
     if args.command == "resolve":
         write_outputs(resolve(os.environ))
-    else:
+    elif args.command == "check":
         tags = os.environ.get("IMAGE_TAGS", "").splitlines()
         force = os.environ.get("FORCE_BUILD", "").lower() == "true"
         write_outputs({"build": str(needs_build(tags, force)).lower()})
+    else:
+        publish_manifests(
+            os.environ.get("IMAGE_TAGS", "").splitlines(), os.environ["DIGEST_DIR"],
+        )
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
         sys.exit(str(error))
